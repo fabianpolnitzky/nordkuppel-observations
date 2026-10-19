@@ -1,251 +1,462 @@
-from glob import glob  # for file paths
-from os import mkdir, chdir  # for folder creation and switching
-from os.path import exists  # for checking if a folder exists
+"""Bias, dark and flat calibration of Nordkuppel CCD frames for all filters of one night.
 
-from astropy.io import fits  # for opening the files
-from astropy.stats import sigma_clip  # for sigma clipping
-from astroscrappy import detect_cosmics  # for cosmics removal
+Usage::
 
-from sep import Background  # for background estimation and calculation
+    python Nordkuppel_Reduction.py NGC7380/20220719
+    python Nordkuppel_Reduction.py NGC7380/20220719 --filters ha s2 --output NGC7380/20220719/Reduced_test
+    python Nordkuppel_Reduction.py --help
 
-import numpy as np  # for array calculations
+Every setting is a command-line option; the defaults are in ``ReductionSettings``. When run by ``postprocess.sh``,
+the values set there are passed on. Output goes to ``<night_dir>/Reduced`` unless ``--output`` is given.
+"""
+
+from collections.abc import Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Annotated, Literal
+
+import numpy as np
+from astropy.io import fits
+from astropy.stats import sigma_clip, sigma_clipped_stats
+from astroscrappy import detect_cosmics  # ty: ignore[unresolved-import]  # compiled, no type information
+from beartype import beartype
+from cyclopts import App, Parameter
+from cyclopts.validators import Number
+from numpy.typing import NDArray
+from sep import Background  # ty: ignore[unresolved-import]  # compiled, no type information
+
+type Image = NDArray[np.float32]  # one 2D frame
+
+type Mask = NDArray[np.bool_]  # True at bad pixels
+
+type Filter = Literal["ha", "o3", "s2"]  # tag of each filter in the light and output file names
+
+FLAT_TAGS: dict[Filter, str] = {"ha": "ha", "o3": "o3", "s2": "sii"}  # tag of each filter in the flat file names
+
+type Positive = Annotated[float, Parameter(validator=Number(gt=0))]
+
 
 # ==================================================================================================================== #
 # SETTINGS
-# Here the settings for the reduction are specified. The file directory and the names of the specific file types are
-# given. Additional settings can be turned on by setting them True, like saving the master correction files or applying
-# sigma clipping to the bias and dark files. Cosmics removal for the light files can also be applied with the
-# detect_cosmics function from astroscrappy and the background can be subtracted from the files.
 
-file_path = "C:/Users/fabia/Documents/Observations/Nordkuppel/NGC7380/20220719/"  # specify where the files are saved
 
-bias_file = "20220719-*_bias.fit"  # the name of the bias files
+def odd(type_: object, value: tuple[int, ...]) -> None:
+    """Raise a ValueError unless every element of ``value`` is odd; a cyclopts validator."""
+    if any(v % 2 == 0 for v in value):
+        raise ValueError("must be odd")
 
-dark_file = "20220719-*_dark.fit"  # the name of the dark files
 
-flat_file = "20220719-*_flat_sii.fit"  # the name of the flat files for one filter
+@beartype
+@dataclass(frozen=True, kw_only=True)
+class ReductionSettings:
+    """Settings of the reduction, each available as a command-line option.
 
-light_file = "20220719-*_s2_light.fit"  # the name of the light files for one filter
+    Parameters
+    ----------
+    bias_file : str
+        Glob pattern of the bias frames, relative to the night directory.
+    dark_file : str
+        Glob pattern of the dark frames.
+    flat_file : str
+        Glob pattern of the flat frames; ``{filter}`` is replaced by the flat tag of each filter (``sii`` for ``s2``).
+    light_files : tuple of str
+        Glob patterns of the light frames; ``{filter}`` is replaced by the filter. The naming differs between nights.
+    save_masters : bool
+        Also save the master bias and dark (the master flats are always saved).
+    bad_pixel_mask : bool
+        Mark hot pixels (from the master dark) and dead or overly sensitive pixels (from the master flat) as bad
+        in the weight map ``mask_<filter>.fits`` written next to the reduced frames, so that SExtractor and SWarp
+        ignore them. Hot pixels cannot be dark subtracted exactly and otherwise leave specks and rings in the stack.
+    hot_sigma : float
+        A pixel is hot if its dark current is more than this many standard deviations above the median.
+    flat_limits : tuple of float
+        A pixel is bad if its normalised flat-field response is outside this range.
+    sigma_clipping : bool
+        Sigma clip the bias, dark and flat stacks pixel by pixel along the frame axis before combining them.
+    clip_sigma : float
+        Threshold of the sigma clipping, in standard deviations.
+    cosmics_removal : bool
+        Remove cosmic rays from the light frames with astroscrappy.
+    laplacian_to_noise : float
+        Laplacian-to-noise limit for the cosmic-ray detection.
+    fractional_detection : float
+        Fractional detection limit for neighbouring pixels in the cosmic-ray detection.
+    object_limit : float
+        Minimum contrast between the Laplacian and the fine-structure image in the cosmic-ray detection.
+    gain : float
+        Gain (electron/ADU) for the cosmic-ray noise model.
+    read_noise : float
+        Read noise (electron) for the cosmic-ray noise model; 19 e was measured from bias pairs of 20220712.
+    background_subtraction : bool
+        Subtract the background of the light frames with sep.
+    box_size : tuple of int
+        Background box size along x and y (px).
+    filter_size : tuple of int
+        Size of the median filter of the background map along x and y (boxes); both must be odd.
+    wcs_center : tuple of float
+        RA and Dec (deg) written as CRVAL1 and CRVAL2, at the image centre; the starting point for SCAMP.
+    wcs_cd : tuple of float
+        WCS matrix CD1_1, CD1_2, CD2_1, CD2_2 (deg/px). The default is the median SCAMP solution of the NGC 7380
+        frames: 0.5543"/px with the x axis mirrored (RA increases with x); the camera rotation differs by about
+        2 deg between nights and is left at zero.
+    """
 
-save_images = (
-    False  # saves the master correction files if True (Master Flat is always saved)
-)
+    bias_file: str = "*_bias.fit"
+    dark_file: str = "*_dark.fit"
+    flat_file: str = "*_flat_{filter}.fit"
+    light_files: tuple[str, ...] = ("*_light_{filter}.fit", "*_{filter}_light.fit")
+    save_masters: bool = False
+    bad_pixel_mask: bool = True
+    hot_sigma: Positive = 10.0
+    flat_limits: tuple[float, float] = (0.5, 1.5)
+    sigma_clipping: bool = True
+    clip_sigma: Positive = 3.0
+    cosmics_removal: bool = True
+    laplacian_to_noise: Positive = 5.0
+    fractional_detection: Positive = 0.3
+    object_limit: Positive = 10.0
+    gain: Positive = 1.56
+    read_noise: Positive = 19.0
+    background_subtraction: bool = False
+    box_size: tuple[int, int] = (50, 50)
+    filter_size: Annotated[tuple[int, int], Parameter(validator=odd)] = (3, 3)
+    wcs_center: tuple[float, float] = (341.7719, 58.0810)
+    wcs_cd: tuple[float, float, float, float] = (1.5395e-4, 0.0, 0.0, 1.5395e-4)
 
-flat_filter = "s2"  # specifies which filter was used in the saved flat field
 
-sigma_clipping = True  # applies sigma clipping to the dark and flat fields during the reduction process if True
+# ==================================================================================================================== #
+# HELPERS
 
-sigma_clipping_value = 3  # the threshold for the values of the sigma clipping
 
-cosmics_removal = False  # applies a cosmics removal algorithm to the light files if True
+@beartype
+def find_files(night_dir: Path, *patterns: str) -> list[Path]:
+    """Return the sorted files in ``night_dir`` matching any of ``patterns``.
 
-LaplacianToNoise = 5  # The Laplacian-to-noise limit for cosmic ray detection.
+    Parameters
+    ----------
+    night_dir : Path
+        Directory of the observing night.
+    *patterns : str
+        Glob patterns relative to ``night_dir``.
 
-FractionalDetection = 0.3  # The Fractional detection limit for neighboring pixels during the cosmic ray detection.
+    Returns
+    -------
+    list of Path
+        Matching files, sorted by name.
 
-gain = 1.56  # The gain in electron/ADU for cosmic ray detection.
+    Raises
+    ------
+    FileNotFoundError
+        If no file matches, so that an empty stack never produces a NaN master frame.
+    """
+    files = sorted({path for pattern in patterns for path in night_dir.glob(pattern)})
+    if not files:
+        raise FileNotFoundError(f"No files matching {' or '.join(map(repr, patterns))} in {night_dir}")
+    return files
 
-object_limit = 10.0  # Minimum contrast between Laplacian image and fine structure image.
 
-read_noise = 6.5  # Read noise of the image in electron to generate the noise model of the image
+@beartype
+def read_frame(path: Path) -> tuple[Image, fits.Header]:
+    """Return the primary data of ``path`` as float32 and its header."""
+    with fits.open(path) as f:
+        return f[0].data.astype(np.float32), f[0].header.copy()
 
-background_subtraction = False  # subtracts the background from the light files
 
-bx, by = 50, 50  # box size along both axis
+@beartype
+def combine(frames: Sequence[Image], clip_sigma: float | None) -> Image:
+    """Combine a stack of frames pixel by pixel into one master frame.
 
-fx, fy = 3, 3  # window size of 2D median filter along both axis, must both be odd
+    If ``clip_sigma`` is given, each pixel is sigma clipped along the frame axis, so that outliers in single frames
+    (cosmic rays, satellite trails) are rejected while structure present in every frame (hot pixels, dust shadows,
+    vignetting) is kept. The surviving values are averaged; once the outliers are clipped, the mean gives a less noisy
+    master than the median.
+
+    Parameters
+    ----------
+    frames : list of numpy.ndarray
+        Frames of identical shape.
+    clip_sigma : float or None
+        Clipping threshold in standard deviations, or None for no clipping.
+
+    Returns
+    -------
+    numpy.ndarray
+        The float32 master frame. Pixels rejected in every frame are NaN.
+    """
+    stack = np.asarray(frames, dtype=np.float32)
+    if clip_sigma is not None:
+        stack = np.ma.filled(sigma_clip(stack, sigma=clip_sigma, maxiters=None, axis=0), np.nan)
+    return np.nanmean(stack, axis=0).astype(np.float32)
+
+
+@beartype
+def save(path: Path, data: Image, header: fits.Header | None = None) -> None:
+    """Write ``data`` as float32 to ``path``, overwriting an existing file."""
+    fits.writeto(path, data=data.astype(np.float32), header=header, overwrite=True)
 
 
 # ==================================================================================================================== #
-# Specification for astrometric solution that is added to the header.
-# For each axis the type of the axis and its unit are defined. A reference coordinate point and a point in the image
-# as pixels are defined. The parameters for the linear projection matrix are defined.
+# MASTER FRAMES
 
-# First axis
 
-ctype1 = "RA---TAN"  # WCS projection type for this axis
+@beartype
+def make_master_bias(files: Sequence[Path], clip_sigma: float | None) -> Image:
+    """Return the master bias as the combined stack of all bias frames, clipped at ``clip_sigma`` if given."""
+    return combine([read_frame(path)[0] for path in files], clip_sigma)
 
-cunit1 = "deg"  # Axis unit
 
-crval1 = 341.8167  # World coordinate on this axis
+@beartype
+def make_master_dark(files: Sequence[Path], master_bias: Image, clip_sigma: float | None) -> Image:
+    """Return the master dark-current rate.
 
-crpix1 = 2048.00  # Reference pixel of first axis
+    Each dark is bias subtracted and divided by its exposure time from the ``EXPOSURE`` header keyword before the stack
+    is combined, so the master can be scaled to any exposure time.
 
-cd11 = -1.5389e-4  # Linear projection matrix
+    Parameters
+    ----------
+    files : list of Path
+        Dark frames.
+    master_bias : numpy.ndarray
+        Master bias.
+    clip_sigma : float or None
+        Clipping threshold for ``combine``, or None for no clipping.
 
-cd12 = 0.0  # Linear projection matrix
+    Returns
+    -------
+    numpy.ndarray
+        Dark current in ADU/s.
+    """
+    darks = []
+    for path in files:
+        data, header = read_frame(path)
+        darks.append((data - master_bias) / header["EXPOSURE"])
+    return combine(darks, clip_sigma)
 
-# Second axis
 
-ctype2 = "DEC--TAN"  # WCS projection type for this axis
+@beartype
+def make_master_flat(files: Sequence[Path], master_bias: Image, master_dark: Image, clip_sigma: float | None) -> Image:
+    """Return the normalised master flat for one filter.
 
-cunit2 = "deg"  # Axis unit
+    Each flat is bias subtracted, the master dark scaled to its exposure time is subtracted, and the result is divided
+    by its median before the stack is combined. The median is only used as the normalisation scale, because it is
+    insensitive to hot pixels and stars; any scale common to all flats cancels in the reduction.
 
-crval2 = 58.1250  # World coordinate on this axis
+    Parameters
+    ----------
+    files : list of Path
+        Flat frames of one filter.
+    master_bias : numpy.ndarray
+        Master bias.
+    master_dark : numpy.ndarray
+        Master dark-current rate in ADU/s.
+    clip_sigma : float or None
+        Clipping threshold for ``combine``, or None for no clipping.
 
-crpix2 = 2048.00  # Reference pixel of second axis
+    Returns
+    -------
+    numpy.ndarray
+        Master flat with a median close to one.
+    """
+    flats = []
+    for path in files:
+        data, header = read_frame(path)
+        flat = data - master_bias - master_dark * header["EXPOSURE"]
+        flats.append(flat / np.nanmedian(flat))
+    return combine(flats, clip_sigma)
 
-cd21 = 0.0  # Linear projection matrix
 
-cd22 = 1.5389e-4  # Linear projection matrix
+@beartype
+def make_bad_pixel_mask(master_dark: Image, master_flat: Image, settings: ReductionSettings) -> Mask:
+    """Return the pixels that cannot be calibrated reliably.
 
-# ==================================================================================================================== #
-# Here the directory is changed to the one where the observational data is saved and a new directory is made if it
-# doesn't exist already. The master files and the reduced images will be saved in this folder afterward.
+    Hot pixels have a dark current far above the rest; their dark subtraction leaves residuals of several sigma with
+    either sign, which become specks and, after resampling, rings in the stack. Pixels whose flat-field response is far
+    from one, or not finite, are dead or defective.
 
-chdir(file_path)
+    Parameters
+    ----------
+    master_dark : numpy.ndarray
+        Master dark-current rate in ADU/s.
+    master_flat : numpy.ndarray
+        Normalised master flat.
+    settings : ReductionSettings
+        Source of ``bad_pixel_mask``, ``hot_sigma`` and ``flat_limits``; with ``bad_pixel_mask`` off no pixel is bad.
 
-if not exists("Reduced"):
-    mkdir("Reduced")
+    Returns
+    -------
+    numpy.ndarray of bool
+        True at bad pixels.
+    """
+    if not settings.bad_pixel_mask:
+        return np.zeros(master_dark.shape, dtype=bool)
+    _, median, sigma = sigma_clipped_stats(master_dark)
+    hot = master_dark > median + settings.hot_sigma * sigma
+    low, high = settings.flat_limits
+    with np.errstate(invalid="ignore"):
+        defective = ~np.isfinite(master_flat) | (master_flat < low) | (master_flat > high)
+    return np.asarray(hot | defective, dtype=bool)
 
-# ==================================================================================================================== #
-# MASTER BIAS
-# All bias files are added to an array and the master bias is calculated as the mean of all bias files. The master bias
-# file can be saved.
-
-path_bias = glob(file_path + bias_file)
-
-biases = np.array([fits.getdata(path) for path in path_bias])
-
-master_bias = np.nanmean(biases, axis=0)
-
-if save_images:
-    fits.writeto(
-        "Reduced/master_bias.fits", data=master_bias, header=None, overwrite=True
-    )
-
-print("Master bias is finished.")
-
-# ==================================================================================================================== #
-# MASTER DARK
-# It is looped over all dark files. The dark file is read out and the master bias is subtracted. The exposure time from
-# the header for the dark file is read out and the dark is divided by it and appended to the list. Sigma clipping can be
-# applied to all dark files with the value specified beforehand. The master dark is calculated as the mean and the file
-# can be saved.
-
-darks = []
-
-for file in glob(dark_file):
-    with fits.open(file) as f:
-        dark_b = f[0].data - master_bias
-
-        if sigma_clipping:
-            dark_c = sigma_clip(dark_b, sigma=sigma_clipping_value, maxiters=None)
-            dark_b = dark_c.filled(np.median(dark_b))
-
-        dark_exp = f[0].header["EXPOSURE"]
-
-        darks.append(dark_b / dark_exp)
-
-master_dark = np.nanmean(darks, axis=0)
-
-if save_images:
-    fits.writeto(
-        "Reduced/master_dark.fits", data=master_dark, header=None, overwrite=True
-    )
-
-print("Master dark is finished.")
-
-# ==================================================================================================================== #
-# MASTER FLAT
-# It is looped over all flat files. The flat file is read out and the master bias is subtracted. The exposure time from
-# the header for the flat file is read out and the master dark is scaled by that value and subtracted from the flat
-# file. The flat file is appended to the list and first divided by its mean value. Sigma clipping can be applied to all
-# flat files with the value specified beforehand. The master flat is calculated as the mean and the file will always be
-# saved for later reduction purpose
-
-flats = []
-
-for file in glob(flat_file):
-    with fits.open(file) as f:
-        flat_b = f[0].data - master_bias
-
-        flat_exp = f[0].header["EXPOSURE"]
-        flat_bd = flat_b - master_dark * flat_exp
-
-        if sigma_clipping:
-            flat_c = sigma_clip(flat_bd, sigma=sigma_clipping_value, maxiters=None)
-            flat_bd = flat_c.filled(np.median(flat_bd))
-
-        flats.append(flat_bd / np.nanmean(flat_bd))
-
-master_flat = np.nanmean(flats, axis=0)
-
-fits.writeto(
-    "Reduced/master_flat_" + flat_filter + ".fits",
-    data=master_flat,
-    header=None,
-    overwrite=True,
-)
-
-print("Master flat is finished.")
 
 # ==================================================================================================================== #
 # LIGHT REDUCTION
-# It is looped over all light files. The light file is read out and the master bias is subtracted. The exposure time
-# from the header for the light file is read out and the master dark is scaled by that value and subtracted from the
-# light file. The light file is divided by the master flat. If enabled the cosmic rays in the light file are identified
-# and removed with the before defined settings. The overall background of the image can be subtracted with the
-# SExtractor algorithm with predetermined settings for box and filter sizes. The keywords needed for the astrometric
-# solution specified with their value and comment are added to the header. The reduced light file is saved with the
-# original header from the light file.
 
-for file in glob(light_file):
 
-    with fits.open(file) as f:
+@beartype
+def add_wcs(header: fits.Header, shape: tuple[int, ...], settings: ReductionSettings) -> None:
+    """Write a TAN WCS from ``settings`` into ``header``, with the reference pixel at the image centre.
 
-        light_b = f[0].data - master_bias
+    Parameters
+    ----------
+    header : astropy.io.fits.Header
+        Header to update in place.
+    shape : tuple of int
+        Image shape as (ny, nx).
+    settings : ReductionSettings
+        Source of ``wcs_center`` and ``wcs_cd``.
+    """
+    ny, nx = shape
+    cd11, cd12, cd21, cd22 = settings.wcs_cd
+    header["CTYPE1"] = ("RA---TAN", "WCS projection type for this axis")
+    header["CUNIT1"] = ("deg", "Axis unit")
+    header["CRVAL1"] = (settings.wcs_center[0], "World coordinate on this axis")
+    header["CRPIX1"] = ((nx + 1) / 2, "Reference pixel of first axis")
+    header["CD1_1"] = (cd11, "Linear projection matrix")
+    header["CD1_2"] = (cd12, "Linear projection matrix")
+    header["CTYPE2"] = ("DEC--TAN", "WCS projection type for this axis")
+    header["CUNIT2"] = ("deg", "Axis unit")
+    header["CRVAL2"] = (settings.wcs_center[1], "World coordinate on this axis")
+    header["CRPIX2"] = ((ny + 1) / 2, "Reference pixel of second axis")
+    header["CD2_1"] = (cd21, "Linear projection matrix")
+    header["CD2_2"] = (cd22, "Linear projection matrix")
 
-        light_exp = f[0].header["EXPOSURE"]
-        light_bd = light_b - master_dark * light_exp
 
-        light_bdf = light_bd / master_flat
+@beartype
+def reduce_light(
+    path: Path, master_bias: Image, master_dark: Image, master_flat: Image, bad: Mask, settings: ReductionSettings
+) -> tuple[Image, fits.Header]:
+    """Calibrate one light frame.
 
-        if cosmics_removal:
-            cr_mask, light_bdf = detect_cosmics(
-                light_bdf,
-                sigclip=LaplacianToNoise,
-                sigfrac=FractionalDetection,
-                objlim=object_limit,
-                gain=gain,
-            )
-            print("There are {} cosmics detected".format(np.sum(cr_mask)))
+    The master bias and the master dark scaled to the exposure time are subtracted and the result is divided by the
+    master flat. If enabled, cosmic rays are removed with astroscrappy, which leaves the bad pixels alone (they are
+    excluded through the weight map instead), and the background is subtracted with sep. The astrometric solution is
+    added to the original header.
 
-        if background_subtraction:
-            bkg = Background(light_bdf, bw=bx, bh=by, fw=fx, fh=fy)
-            light_bdf = light_bdf - bkg.back()
+    Parameters
+    ----------
+    path : Path
+        Light frame.
+    master_bias : numpy.ndarray
+        Master bias.
+    master_dark : numpy.ndarray
+        Master dark-current rate in ADU/s.
+    master_flat : numpy.ndarray
+        Normalised master flat of the same filter.
+    bad : numpy.ndarray of bool
+        Bad-pixel mask, passed to astroscrappy.
+    settings : ReductionSettings
+        Cosmic-ray, background and WCS settings.
 
-        f[0].header["CTYPE1"] = (ctype1, "WCS projection type for this axis")
+    Returns
+    -------
+    data : numpy.ndarray
+        Reduced float32 image.
+    header : astropy.io.fits.Header
+        Original header with the WCS keywords added.
+    """
+    data, header = read_frame(path)
+    light = (data - master_bias - master_dark * header["EXPOSURE"]) / master_flat
 
-        f[0].header["CUNIT1"] = (cunit1, "Axis unit")
-
-        f[0].header["CRVAL1"] = (crval1, "World coordinate on this axis")
-
-        f[0].header["CRPIX1"] = (crpix1, "Reference pixel of first axis")
-
-        f[0].header["CD1_1"] = (cd11, "Linear projection matrix")
-
-        f[0].header["CD1_2"] = (cd12, "Linear projection matrix")
-
-        f[0].header["CTYPE2"] = (ctype2, "WCS projection type for this axis")
-
-        f[0].header["CUNIT2"] = (cunit2, "Axis unit")
-
-        f[0].header["CRVAL2"] = (crval2, "World coordinate on this axis")
-
-        f[0].header["CRPIX2"] = (crpix2, "Reference pixel of second axis")
-
-        f[0].header["CD2_1"] = (cd21, "Linear projection matrix")
-
-        f[0].header["CD2_2"] = (cd22, "Linear projection matrix")
-
-        fits.writeto(
-            "Reduced/reduced_" + file,
-            data=light_bdf,
-            header=f[0].header,
-            overwrite=True,
+    if settings.cosmics_removal:
+        cr_mask, light = detect_cosmics(
+            light,
+            inmask=bad,
+            sigclip=settings.laplacian_to_noise,
+            sigfrac=settings.fractional_detection,
+            objlim=settings.object_limit,
+            gain=settings.gain,
+            readnoise=settings.read_noise,
         )
+        print(f"There are {np.sum(cr_mask)} cosmics detected")
 
-        print("The reduction of file", file, "is finished.")
+    if settings.background_subtraction:
+        light = np.ascontiguousarray(light, dtype=np.float32)
+        (bw, bh), (fw, fh) = settings.box_size, settings.filter_size
+        bkg = Background(light, bw=bw, bh=bh, fw=fw, fh=fh)
+        light = light - bkg.back()
 
-print("The whole reduction process is finished.")
+    add_wcs(header, light.shape, settings)
+    return light.astype(np.float32), header
+
+
+# ==================================================================================================================== #
+# MAIN
+
+app = App(help_format="rst", version_flags=(), default_parameter=Parameter(consume_multiple=True, negative_iterable=()))
+
+
+@app.default
+@beartype
+def main(
+    night_dir: Path,
+    *,
+    filters: tuple[Filter, ...] = ("ha", "o3", "s2"),
+    output: Path | None = None,
+    settings: Annotated[ReductionSettings, Parameter(name="*")] = ReductionSettings(),
+) -> None:
+    """Reduce the light frames of one night for all requested filters.
+
+    Parameters
+    ----------
+    night_dir : Path
+        Directory with the raw frames of one night.
+    filters : tuple of str
+        Filters to reduce.
+    output : Path
+        Output directory; default ``<night_dir>/Reduced``.
+    """
+    out_dir = output if output is not None else night_dir / "Reduced"
+    clip_sigma = settings.clip_sigma if settings.sigma_clipping else None
+
+    # Look up every frame type first, so a missing pattern fails before any computation is done.
+    bias_files = find_files(night_dir, settings.bias_file)
+    dark_files = find_files(night_dir, settings.dark_file)
+    filter_files = {
+        filt: (
+            find_files(night_dir, settings.flat_file.format(filter=FLAT_TAGS[filt])),
+            find_files(night_dir, *(pattern.format(filter=filt) for pattern in settings.light_files)),
+        )
+        for filt in filters
+    }
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    master_bias = make_master_bias(bias_files, clip_sigma)
+    if settings.save_masters:
+        save(out_dir / "master_bias.fits", master_bias)
+    print(f"Master bias is finished ({len(bias_files)} frames).")
+
+    master_dark = make_master_dark(dark_files, master_bias, clip_sigma)
+    if settings.save_masters:
+        save(out_dir / "master_dark.fits", master_dark)
+    print(f"Master dark is finished ({len(dark_files)} frames).")
+
+    for filt, (flat_files, light_files) in filter_files.items():
+        master_flat = make_master_flat(flat_files, master_bias, master_dark, clip_sigma)
+        save(out_dir / f"master_flat_{filt}.fits", master_flat)
+        print(f"Master flat {filt} is finished ({len(flat_files)} frames).")
+
+        # Weight map for SExtractor and SWarp: 0 at bad pixels, 1 elsewhere.
+        bad = make_bad_pixel_mask(master_dark, master_flat, settings)
+        save(out_dir / f"mask_{filt}.fits", (~bad).astype(np.float32))
+        print(f"Bad-pixel mask {filt}: {bad.sum()} pixels ({100 * bad.mean():.2f} %).")
+
+        for path in light_files:
+            light, header = reduce_light(path, master_bias, master_dark, master_flat, bad, settings)
+            save(out_dir / f"reduced_{path.name}", light, header)
+        print(f"The reduction of {len(light_files)} {filt} light frames is finished.")
+
+    print("The whole reduction process is finished.")
+
+
+if __name__ == "__main__":
+    app()
