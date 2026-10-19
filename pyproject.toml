@@ -1,9 +1,42 @@
 [project]
 name = "observations"
 version = "0.1.0"
-description = "Add your description here"
+authors = [{name = "Fabian Polnitzky", email = "fabian.polnitzky@rwth-aachen.de"}]
+description = "Reduction and stacking pipeline for the Nordkuppel telescope at the Institute of Astrophysics, University of Vienna"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
-    "numpy==1.26.4",
+    "astropy>=7.2.3",
+    "astroscrappy>=1.3.0",
+    "beartype>=0.23.1",
+    "cyclopts>=5.2.0",
+    "numpy>=1.26.4",
+    "ruff>=0.17.1",
+    "sep>=1.4.1",
+    "ty>=0.0.89",
 ]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = [
+    "F",    # pyflakes: undefined names, unused imports and variables
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "B",    # flake8-bugbear: likely bugs
+    "NPY",  # numpy-specific mistakes
+    "RUF",  # ruff-specific checks
+    "UP",   # modern syntax for the target Python version
+    "I",    # import order
+    "ANN",  # every function has type annotations
+    "D",    # docstrings
+    "EXE",  # shebangs and executable bits
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"
+
+[tool.ruff.lint.flake8-bugbear]
+# frozen dataclasses, safe as default arguments of the cyclopts entry points
+extend-immutable-calls = ["Nordkuppel_Reduction.ReductionSettings", "prepare_composite.CompositeSettings"]

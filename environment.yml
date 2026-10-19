@@ -1,0 +1,10 @@
+# Astromatic programs used by postprocess.sh. The Python reduction runs in the uv project instead.
+#   micromamba create -f environment.yml
+name: astromatic
+channels:
+  - conda-forge
+dependencies:
+  - astromatic-source-extractor=2.28.2
+  - astromatic-scamp=2.15.0
+  - astromatic-swarp=2.41.5
+  - astromatic-stiff=2.4.0
