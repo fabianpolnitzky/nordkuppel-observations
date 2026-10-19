@@ -12,8 +12,6 @@ SHO colour image.
 | `Nordkuppel_Reduction.py` | Bias, dark and flat calibration of all filters of one night, with optional cosmic-ray removal and background subtraction; called by `postprocess.sh` |
 | `prepare_composite.py` | Crops the per-filter stacks to the area covered well in every filter and chooses the colour levels; called by `postprocess.sh` |
 | `environment.yml` | micromamba/conda environment with the astromatic programs |
-| `TODO.md` | Open issues |
-| `rename.sh` | Strips trailing ` (…)` suffixes from the file names in the current directory |
 | `sextractor.param`, `gauss_2.5_5x5.conv` | SExtractor output parameters and a 5 × 5 Gaussian filter kernel (FWHM 2.5 px) |
 
 ## Data layout
