@@ -4,7 +4,7 @@
 # Usage:
 #   ./postprocess.sh OUT_DIR NIGHT_DIR [NIGHT_DIR ...]   full pipeline
 #   ./postprocess.sh --render OUT_DIR                    only redo the colour image from the
-#                                                        existing stacks in OUT_DIR (a few seconds)
+#                                                        existing stacks in OUT_DIR (about 15 seconds)
 # Examples:
 #   ./postprocess.sh NGC7380/stack NGC7380/20220712 NGC7380/20220719
 #   WHITE_SCALE=2.5 STIFF_GAMMA_FAC=1.2 ./postprocess.sh --render NGC7380/stack
@@ -94,6 +94,23 @@ DARK_FRACTION=${DARK_FRACTION:-0.05}          # levels: fraction of darkest bloc
 NEBULA_PERCENTILE=${NEBULA_PERCENTILE:-90}    # levels: percentile that measures the nebula brightness
 WHITE_SCALE=${WHITE_SCALE:-3.0}               # white point per channel, in units of its nebula brightness
                                               # above the black point; lower is brighter
+# Optional colour steps towards the gold-and-blue SHO look; each is switched on or off on its own
+SCALE_CHANNELS=${SCALE_CHANNELS:-true}        # multiply each channel's brightness by CHANNEL_SCALE
+CHANNEL_SCALE=${CHANNEL_SCALE:-"1.15 1.0 0.85"}  # factors for red, green, blue: a bit more SII and less OIII
+                                              # shifts the balance from blue towards gold; a green factor
+                                              # below 1 tints faint areas magenta
+RAISE_BLACK=${RAISE_BLACK:-true}              # raise the black point above the faint nebula and its noise
+BLACK_OFFSET=${BLACK_OFFSET:-0.04}            # the raise, as a fraction of each channel's stretch range
+SMOOTH_COLOUR=${SMOOTH_COLOUR:-true}          # smooth the noisy SII and OIII (all but DARK_REFERENCE), not the stars
+COLOUR_SIGMA=${COLOUR_SIGMA:-1.5}             # width of that smoothing (px, Gaussian sigma)
+SMOOTH_FAINT=${SMOOTH_FAINT:-true}            # smooth DARK_REFERENCE (Halpha) in its faint parts only
+FAINT_SIGMA=${FAINT_SIGMA:-1.5}               # width of that smoothing (px, Gaussian sigma)
+FAINT_LEVEL=${FAINT_LEVEL:-0.15}              # sharp from this fraction of its stretch range up
+SUPPRESS_GREEN=${SUPPRESS_GREEN:-true}        # lower green where it exceeds the mean of red and blue after the
+                                              # stretch: orange Halpha/SII, blue OIII instead of all green
+GREEN_SUPPRESSION=${GREEN_SUPPRESSION:-1.0}   # fraction of that excess removed (1: green never exceeds the mean)
+SMOOTH_SUPPRESSION=${SMOOTH_SUPPRESSION:-true}  # measure the excess on smoothed copies (COLOUR_SIGMA); per pixel,
+                                              # the noise turns faint areas magenta
 NEUTRAL_STARS=${NEUTRAL_STARS:-true}          # make star light neutral (white) instead of pink; the
                                               # nebula colour under the stars is kept
 STAR_STRENGTH=${STAR_STRENGTH:-1.0}           # stars: 0 keeps their colour, 1 makes them fully neutral
@@ -102,8 +119,9 @@ STAR_MIN_EXCESS=${STAR_MIN_EXCESS:-2.0}       # stars: min. stretched flux in th
 STAR_MASK_SCALE=${STAR_MASK_SCALE:-2.5}       # stars: mask size in units of each star's detected radius
 STAR_FEATHER=${STAR_FEATHER:-1.5}             # stars: soft mask edge (px)
 STAR_BACKGROUND_BOX=${STAR_BACKGROUND_BOX:-32}  # stars: box (px) for the local background under them
+STIFF_GAMMA=${STIFF_GAMMA:-2.2}               # STIFF display gamma (power-law stretch)
 STIFF_GAMMA_FAC=${STIFF_GAMMA_FAC:-1.0}       # STIFF stretch; above 1 brightens the faint nebula
-STIFF_COLOUR_SAT=${STIFF_COLOUR_SAT:-1.0}     # STIFF colour saturation
+STIFF_COLOUR_SAT=${STIFF_COLOUR_SAT:-1.3}     # STIFF colour saturation (1 unchanged)
 STIFF_BITS=${STIFF_BITS:-16}                  # bits per colour channel of the TIFF (8 or 16)
 RGB_NAME=${RGB_NAME:-SHO.tif}                 # name of the colour composite
 
@@ -319,14 +337,18 @@ coadd() {
 # STEPS 6 AND 7: CROP, LEVELS AND STIFF
 
 render() {
-    local levels black white filt crops=()
+    local levels black white filt gamma crops=()
     echo "Rendering with WHITE_SCALE=$WHITE_SCALE STIFF_GAMMA_FAC=$STIFF_GAMMA_FAC" \
-        "STIFF_COLOUR_SAT=$STIFF_COLOUR_SAT NEUTRAL_STARS=$NEUTRAL_STARS STAR_STRENGTH=$STAR_STRENGTH"
+        "STIFF_COLOUR_SAT=$STIFF_COLOUR_SAT NEUTRAL_STARS=$NEUTRAL_STARS SCALE_CHANNELS=$SCALE_CHANNELS" \
+        "RAISE_BLACK=$RAISE_BLACK SMOOTH_COLOUR=$SMOOTH_COLOUR SMOOTH_FAINT=$SMOOTH_FAINT" \
+        "SUPPRESS_GREEN=$SUPPRESS_GREEN"
+    # the green suppression is measured in STIFF's stretch, x^(1 / (GAMMA * GAMMA_FAC))
+    gamma=$(awk -v g="$STIFF_GAMMA" -v f="$STIFF_GAMMA_FAC" 'BEGIN { print g * f }')
 
     # The pointings wander by up to a frame width, so only the centre is well covered in every
     # filter. The black point of each channel is its level in the darkest parts of the field and
     # the white point is set by the nebula, not the stars; prints "black1,black2,black3 white1,...".
-    # shellcheck disable=SC2086  # RGB_FILTERS is a word list on purpose
+    # shellcheck disable=SC2086  # RGB_FILTERS and CHANNEL_SCALE are word lists on purpose
     levels=$("$UV" run --project "$REPO" python "$REPO/prepare_composite.py" . $RGB_FILTERS \
         --crop-shape "$CROP_SHAPE" \
         --min-weight "$MIN_WEIGHT" \
@@ -339,6 +361,19 @@ render() {
         --dark-fraction "$DARK_FRACTION" \
         --nebula-percentile "$NEBULA_PERCENTILE" \
         --white-scale "$WHITE_SCALE" \
+        --scale-channels="$SCALE_CHANNELS" \
+        --channel-scale $CHANNEL_SCALE \
+        --raise-black="$RAISE_BLACK" \
+        --black-offset "$BLACK_OFFSET" \
+        --smooth-colour="$SMOOTH_COLOUR" \
+        --colour-sigma "$COLOUR_SIGMA" \
+        --smooth-faint="$SMOOTH_FAINT" \
+        --faint-sigma "$FAINT_SIGMA" \
+        --faint-level "$FAINT_LEVEL" \
+        --suppress-green="$SUPPRESS_GREEN" \
+        --green-suppression "$GREEN_SUPPRESSION" \
+        --smooth-suppression="$SMOOTH_SUPPRESSION" \
+        --gamma "$gamma" \
         --neutral-stars="$NEUTRAL_STARS" \
         --star-strength "$STAR_STRENGTH" \
         --star-threshold "$STAR_THRESHOLD" \
@@ -357,6 +392,7 @@ render() {
         -BITS_PER_CHANNEL "$STIFF_BITS" \
         -MIN_TYPE MANUAL -MIN_LEVEL "$black" \
         -MAX_TYPE MANUAL -MAX_LEVEL "$white" \
+        -GAMMA "$STIFF_GAMMA" \
         -GAMMA_FAC "$STIFF_GAMMA_FAC" \
         -COLOUR_SAT "$STIFF_COLOUR_SAT" \
         -XML_NAME stiff.xml

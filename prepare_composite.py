@@ -16,8 +16,13 @@ inside it, or the area covered by a minimum number of frames, counted from the f
 The black point of every filter is its level in the darkest parts of the field (found in the reference filter), so
 that dark areas come out neutral. The white point is set by the nebula, not by the stars, so that the faint filters
 contribute as much colour as the bright one. Stars are about equally bright in all filters, so this stretch makes them
-pink; optionally their light is made neutral inside a star mask (``star_mask.fits``). Every setting is a command-line
-option; the defaults are in ``CompositeSettings``, and ``postprocess.sh`` passes on the values set there.
+pink; optionally their light is made neutral inside a star mask (``star_mask.fits``).
+
+Further optional steps, each with its own switch, bring the image closer to the usual gold-and-blue SHO look: a
+brightness factor per channel, a black point raised above the faint nebula and its noise, smoothing of the noisy SII
+and OIII channels and of the faint parts of Halpha, and suppression of green where it exceeds the mean of red and
+blue after the stretch (Halpha, strong all over the nebula, otherwise turns the image green). Every setting is a
+command-line option; the defaults are in ``CompositeSettings``, and ``postprocess.sh`` passes on the values set there.
 """
 
 import sys
@@ -93,6 +98,42 @@ class CompositeSettings:
         Percentile that measures the nebula brightness in each filter.
     white_scale : float
         White point = black point + ``white_scale`` x (nebula brightness - black point); lower is brighter.
+    scale_channels : bool
+        Multiply the brightness of each colour channel by ``channel_scale`` (its white point is divided by it).
+    channel_scale : tuple of float
+        Brightness factors of red, green and blue, e.g. ``1 0.6 1`` to tone down Halpha (green in SHO), which is
+        strong all over the nebula. Only the white point moves, so faint areas take on a tint (magenta for a green
+        factor below 1); use it together with ``raise_black``.
+    raise_black : bool
+        Raise the black point of every channel above the faint nebula and its noise, so that the sky comes out dark.
+    black_offset : float
+        The raise, as a fraction of each channel's stretch range before ``channel_scale`` (the same for all
+        channels, so dark areas stay neutral). About 0.04 with ``smooth_colour``; without it the noise is several
+        times larger and the black point cannot hide it without also hiding the faint nebula.
+    smooth_colour : bool
+        Smooth every channel except the reference filter (SII and OIII, which are about three times noisier than
+        Halpha after the stretch); the reference keeps the fine detail. Inside the star mask the sharp data are kept,
+        so stars get no coloured rims (only with ``neutral_stars``; otherwise the stars are smoothed too).
+    colour_sigma : float
+        Width (px, Gaussian sigma) of that smoothing.
+    smooth_faint : bool
+        Smooth the reference filter in its faint parts only, which removes the noise speckle in the dark areas and
+        keeps the bright nebula and the stars sharp.
+    faint_sigma : float
+        Width (px, Gaussian sigma) of that smoothing.
+    faint_level : float
+        Brightness, as a fraction of the reference filter's stretch range, up to which its smoothing fades out:
+        fully smoothed at the black point, sharp from this level up.
+    suppress_green : bool
+        Lower the green channel where it is brighter than the mean of red and blue after the stretch, which turns the
+        Halpha and SII regions orange and the OIII regions blue instead of green.
+    green_suppression : float
+        Fraction of that green excess that is removed (1: green never exceeds the mean of red and blue).
+    smooth_suppression : bool
+        Measure the green excess on copies of the channels smoothed by ``colour_sigma``. Measured per pixel, the
+        suppression cuts only the upward noise of green and turns faint, noisy areas magenta.
+    gamma : float
+        Exponent of the stretch in which the green suppression is measured; STIFF's ``GAMMA`` times ``GAMMA_FAC``.
     neutral_stars : bool
         Make the light of stars the same in all colour channels, so that they come out white instead of pink. Only
         the light above the local background is changed, so the nebula colour under the stars is kept.
@@ -122,6 +163,19 @@ class CompositeSettings:
     dark_fraction: Fraction = 0.05
     nebula_percentile: Annotated[float, Parameter(validator=Number(gt=0, lt=100))] = 90.0
     white_scale: Positive = 3.0
+    scale_channels: bool = True
+    channel_scale: tuple[Positive, Positive, Positive] = (1.15, 1.0, 0.85)
+    raise_black: bool = True
+    black_offset: Annotated[float, Parameter(validator=Number(gt=0, lt=0.5))] = 0.04
+    smooth_colour: bool = True
+    colour_sigma: Positive = 1.5
+    smooth_faint: bool = True
+    faint_sigma: Positive = 1.5
+    faint_level: Fraction = 0.15
+    suppress_green: bool = True
+    green_suppression: Fraction = 1.0
+    smooth_suppression: bool = True
+    gamma: Positive = 2.2
     neutral_stars: bool = True
     star_strength: Annotated[float, Parameter(validator=Number(gte=0, lte=1))] = 1.0
     star_threshold: Positive = 3.0
@@ -396,14 +450,17 @@ def levels(images: dict[str, Image], valid: Mask, settings: CompositeSettings) -
     valid : numpy.ndarray of bool
         Valid pixels of the crop.
     settings : CompositeSettings
-        Reference filter, block size, dark fraction, nebula percentile and white scale.
+        Reference filter, block size, dark fraction, nebula percentile, white scale, and the channel scale and black
+        offset if switched on.
 
     Returns
     -------
     black : list of float
-        Sigma-clipped level of each filter in the darkest valid blocks of the reference filter.
+        Sigma-clipped level ``sky`` of each filter in the darkest valid blocks of the reference filter, with
+        ``raise_black`` plus ``black_offset * white_scale * (nebula percentile - sky)``.
     white : list of float
-        ``black + white_scale * (nebula percentile - black)`` of each filter.
+        ``sky + white_scale * (nebula percentile - sky)`` of each filter, with ``scale_channels`` divided by the
+        channel's ``channel_scale``.
     """
     size = settings.block_size
     valid_blocks = np.min(blocks(valid.astype(np.float32), size), axis=2) > 0
@@ -413,12 +470,123 @@ def levels(images: dict[str, Image], valid: Mask, settings: CompositeSettings) -
     )
 
     black, white = [], []
-    for data in images.values():
+    for channel, data in enumerate(images.values()):
         _, sky, _ = sigma_clipped_stats(blocks(data, size)[dark])
         nebula = np.percentile(data[valid], settings.nebula_percentile)
-        black.append(float(sky))
-        white.append(float(sky + settings.white_scale * (nebula - sky)))
+        stretch = settings.white_scale * (nebula - sky)
+        offset = settings.black_offset * stretch if settings.raise_black else 0.0
+        scale = settings.channel_scale[channel] if settings.scale_channels else 1.0
+        black.append(float(sky + offset))
+        white.append(float(sky + stretch / scale))
     return black, white
+
+
+# ==================================================================================================================== #
+# NOISE AND GREEN
+
+
+@beartype
+def smooth(data: Image, valid: Mask, sigma: float) -> Image:
+    """Return ``data`` convolved with a Gaussian of ``sigma`` px; pixels outside ``valid`` are ignored and kept."""
+    smoothed = convolve_fft(np.where(valid, data, np.nan), Gaussian2DKernel(sigma), nan_treatment="interpolate")
+    return np.where(valid, smoothed, data).astype(np.float32)
+
+
+@beartype
+def smooth_channels(
+    images: dict[str, Image],
+    valid: Mask,
+    black: Sequence[float],
+    white: Sequence[float],
+    star_light: Image | None,
+    settings: CompositeSettings,
+) -> dict[str, Image]:
+    """Reduce the noise: smooth the colour channels and the faint parts of the reference filter.
+
+    With ``smooth_colour`` every channel except the reference filter is smoothed by ``colour_sigma``. With
+    ``smooth_faint`` the reference filter is smoothed by ``faint_sigma`` where it is faint: fully at its black point,
+    fading out linearly up to ``faint_level`` of its stretch range (measured on the smoothed data). In both cases the
+    sharp data are kept where there is star light, so that stars get no coloured rims. Only real star light counts:
+    keeping the whole star mask sharp would leave its noise as speckle and discs around the stars.
+
+    Parameters
+    ----------
+    images : dict of str to numpy.ndarray
+        Cropped coadd of each filter, in the order of the colour channels.
+    valid : numpy.ndarray of bool
+        Valid pixels of the crop.
+    black, white : list of float
+        Black and white points of the channels, in the same order.
+    star_light : numpy.ndarray or None
+        Weight (0 to 1) of real star light, from ``neutralise_stars``, or None without star detection (then the stars
+        are smoothed too).
+    settings : CompositeSettings
+        Smoothing settings.
+
+    Returns
+    -------
+    dict of str to numpy.ndarray
+        The smoothed coadds, in the units of the input.
+    """
+    sharp = np.zeros(valid.shape, dtype=np.float32) if star_light is None else star_light
+    result = dict(images)
+    for channel, (filt, data) in enumerate(images.items()):
+        if filt != settings.reference and settings.smooth_colour:
+            weight = sharp
+            smoothed = smooth(data, valid, settings.colour_sigma)
+        elif filt == settings.reference and settings.smooth_faint:
+            smoothed = smooth(data, valid, settings.faint_sigma)
+            brightness = (smoothed - black[channel]) / (settings.faint_level * (white[channel] - black[channel]))
+            weight = np.maximum(np.clip(brightness, 0, 1), sharp)
+        else:
+            continue
+        result[filt] = (smoothed + weight * (data - smoothed)).astype(np.float32)
+    return result
+
+
+@beartype
+def lower_green(
+    images: dict[str, Image], valid: Mask, black: Sequence[float], white: Sequence[float], settings: CompositeSettings
+) -> dict[str, Image]:
+    """Lower the green channel where it is brighter than the mean of red and blue after the stretch.
+
+    Every channel is stretched as STIFF does it: scaled from its black (0) to its white point (1), clipped, and raised
+    to 1 / ``gamma``. Where green exceeds the mean of red and blue there, ``green_suppression`` of the excess is
+    removed and the result converted back to the units of the input; all other pixels keep their value. With
+    ``smooth_suppression`` the excess is measured on copies smoothed by ``colour_sigma``, and the unsmoothed green is
+    multiplied by the ratio of lowered to measured green, so that its detail is kept and its noise, scaled down with
+    it, does not leave green grain where red and blue are dark.
+
+    Parameters
+    ----------
+    images : dict of str to numpy.ndarray
+        Cropped coadd of each filter, in the order red, green, blue.
+    valid : numpy.ndarray of bool
+        Valid pixels of the crop.
+    black, white : list of float
+        Black and white points of the channels, in the same order.
+    settings : CompositeSettings
+        Source of ``green_suppression``, ``smooth_suppression``, ``colour_sigma`` and ``gamma``.
+
+    Returns
+    -------
+    dict of str to numpy.ndarray
+        The coadds with the green channel lowered, in the units of the input.
+    """
+
+    def stretched(data: Image, channel: int) -> Image:
+        return np.clip((data - black[channel]) / (white[channel] - black[channel]), 0, 1) ** (1 / settings.gamma)
+
+    measured = list(images.values())
+    if settings.smooth_suppression:
+        measured = [smooth(data, valid, settings.colour_sigma) for data in measured]
+    red, green, blue = (stretched(data, channel) for channel, data in enumerate(measured))
+    excess = green - (red + blue) / 2
+    ratio = np.clip((green - settings.green_suppression * excess) / np.maximum(green, 1e-6), 0, 1)
+    filt = list(images)[1]
+    reduced = stretched(images[filt], 1) * ratio
+    lowered = np.minimum(black[1] + (white[1] - black[1]) * reduced**settings.gamma, images[filt])
+    return images | {filt: np.where(excess > 0, lowered, images[filt]).astype(np.float32)}
 
 
 # ==================================================================================================================== #
@@ -475,7 +643,7 @@ def star_mask(shape: tuple[int, ...], stars: Catalogue, settings: CompositeSetti
 @beartype
 def neutralise_stars(
     images: dict[str, Image], valid: Mask, black: Sequence[float], white: Sequence[float], settings: CompositeSettings
-) -> tuple[dict[str, Image], Image, int]:
+) -> tuple[dict[str, Image], Image, Image, int]:
     """Make the light of stars equal in all colour channels after the stretch.
 
     Each channel is stretched with its black and white point, its local background is removed, and inside the star
@@ -503,6 +671,8 @@ def neutralise_stars(
         Coadds with neutral stars, in the units of the input.
     mask : numpy.ndarray
         The soft star mask.
+    star_light : numpy.ndarray
+        Where the mask holds real star light: mask x clip(mean star light / (``star_threshold`` x noise), 0, 1).
     n_stars : int
         Number of stars found.
     """
@@ -525,12 +695,13 @@ def neutralise_stars(
     mask = star_mask(valid.shape, stars, settings)
     mean = sum(excess.values()) / len(excess)
     signal = np.clip(mean / (settings.star_threshold * np.maximum(noise, 1e-6)), 0, 1)
-    weight = settings.star_strength * mask * signal
+    star_light = (mask * signal).astype(np.float32)
+    weight = settings.star_strength * star_light
     neutral = {
         filt: (offset[filt] + (stretched[filt] + weight * (mean - excess[filt])) * scale[filt]).astype(np.float32)
         for filt in images
     }
-    return neutral, mask, len(stars)
+    return neutral, mask, star_light, len(stars)
 
 
 # ==================================================================================================================== #
@@ -546,15 +717,20 @@ def main(
     *filters: str,
     settings: Annotated[CompositeSettings, Parameter(name="*")] = CompositeSettings(),
 ) -> None:
-    """Crop all coadds, optionally make the stars neutral, then print the STIFF black and white points.
+    """Crop all coadds, apply the optional colour steps, then print the STIFF black and white points.
+
+    The optional steps run in this order: neutral stars, smoothing, green suppression (the channel scale and the
+    black offset are part of the levels).
 
     Parameters
     ----------
     stack_dir : Path
         Directory with ``coadd_<filter>.fits`` and their weight maps.
     filters : str
-        Filters in the order of the colour channels, e.g. ``s2 ha o3``.
+        The three filters in the order red, green, blue, e.g. ``s2 ha o3``.
     """
+    if len(filters) != 3:
+        sys.exit(f"prepare_composite.py: give three filters (red, green, blue), not {len(filters)}")
     if settings.reference not in filters:
         sys.exit(f"prepare_composite.py: the reference filter '{settings.reference}' is not among {filters}")
     warnings.simplefilter("ignore", FITSFixedWarning)
@@ -579,13 +755,27 @@ def main(
     for filt, b, w in zip(filters, black, white, strict=True):
         print(f"Levels {filt}: black {b:.5g}, white {w:.5g}", file=sys.stderr)
 
+    star_light = None
     if settings.neutral_stars:
-        images, mask, n_stars = neutralise_stars(images, valid, black, white, settings)
+        images, mask, star_light, n_stars = neutralise_stars(images, valid, black, white, settings)
         fits.writeto(stack_dir / "star_mask.fits", mask, cropped[settings.reference][1], overwrite=True)
         print(
             f"Neutral stars: {n_stars} stars, mask covers {100 * (mask[valid] > 0.5).mean():.1f} % (star_mask.fits).",
             file=sys.stderr,
         )
+    if settings.smooth_colour or settings.smooth_faint:
+        images = smooth_channels(images, valid, black, white, star_light, settings)
+    if settings.suppress_green:
+        images = lower_green(images, valid, black, white, settings)
+    steps = {
+        "channel scale": settings.scale_channels,
+        "raised black": settings.raise_black,
+        "smoothed colour": settings.smooth_colour,
+        "smoothed faint parts": settings.smooth_faint,
+        "green suppression": settings.suppress_green,
+    }
+    states = ", ".join(f"{name} {'on' if on else 'off'}" for name, on in steps.items())
+    print(f"Colour steps: {states}.", file=sys.stderr)
 
     # Outside the footprint, one full stretch range below the black point: STIFF renders it black.
     for (filt, data), b, w in zip(images.items(), black, white, strict=True):

@@ -145,14 +145,35 @@ four times brighter than SII and OIII:
 - **white point** of each channel = black point + `WHITE_SCALE` × (its 90th percentile − black
   point), i.e. set by the nebula instead of the stars
 
-The knobs are `WHITE_SCALE` (lower is brighter, default 3), `STIFF_GAMMA_FAC` (above 1 lifts
-the faint nebula) and `STIFF_COLOUR_SAT`. To try values, re-render only the colour image from the
-existing stacks, which takes a few seconds instead of a full run, and give the values on the
-command line, so `postprocess.sh` itself stays unchanged:
+With only these levels the image comes out green and grey: Hα (green in SHO) is strong all over the
+nebula, and the noise of SII and OIII, stretched about 4× harder than Hα, lifts the dark areas to a
+grey veil. Five optional steps, each switched on or off by its own setting, give the usual
+gold-and-blue SHO look with a dark sky; all are on by default:
+
+| Switch | Parameters | What it does |
+|---|---|---|
+| `SCALE_CHANNELS` | `CHANNEL_SCALE` (1.15 1.0 0.85) | brightness factor per channel (red, green, blue); a bit more SII and less OIII shifts the balance from blue towards gold |
+| `RAISE_BLACK` | `BLACK_OFFSET` (0.04) | raises every black point by this fraction of its stretch range, above the faint nebula and its noise, so the sky comes out dark |
+| `SMOOTH_COLOUR` | `COLOUR_SIGMA` (1.5 px) | smooths SII and OIII; Hα keeps the detail, and stars stay sharp |
+| `SMOOTH_FAINT` | `FAINT_SIGMA` (1.5 px), `FAINT_LEVEL` (0.15) | smooths Hα only in its faint parts, against speckle in the dark areas |
+| `SUPPRESS_GREEN` | `GREEN_SUPPRESSION` (1.0), `SMOOTH_SUPPRESSION` | lowers green where it exceeds the mean of red and blue after STIFF's stretch: Hα+SII regions turn orange, OIII regions blue |
+
+They depend on each other: `RAISE_BLACK` without the smoothing cannot darken the sky without also
+hiding the faint nebula (the noise is larger than the faint signal), and the green suppression
+measured per pixel (`SMOOTH_SUPPRESSION=false`) turns faint, noisy areas magenta. A green factor
+below 1 in `CHANNEL_SCALE` also tints faint areas magenta.
+
+The other knobs are `WHITE_SCALE` (lower is brighter, default 3), `STIFF_GAMMA_FAC` (above 1 lifts
+the faint nebula) and `STIFF_COLOUR_SAT` (default 1.3). To try values, re-render only the colour
+image from the existing stacks, which takes about 15 seconds instead of a full run, and give the
+values on the command line, so `postprocess.sh` itself stays unchanged:
 
 ```sh
 ./postprocess.sh --render NGC7380/stack                                      # settings as in postprocess.sh
 WHITE_SCALE=2.5 ./postprocess.sh --render NGC7380/stack                      # brighter
+SCALE_CHANNELS=false RAISE_BLACK=false SMOOTH_COLOUR=false SMOOTH_FAINT=false SUPPRESS_GREEN=false \
+    STIFF_COLOUR_SAT=1 ./postprocess.sh --render NGC7380/stack               # plain SHO (green, grey sky)
+COLOUR_SIGMA=2.5 ./postprocess.sh --render NGC7380/stack                     # smoother colour, less detail
 WHITE_SCALE=2.5 STIFF_GAMMA_FAC=1.2 RGB_NAME=SHO_try.tif ./postprocess.sh --render NGC7380/stack
 ```
 
